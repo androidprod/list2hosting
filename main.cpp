@@ -341,23 +341,30 @@ static void run_server(int p){
 
     logf(INF, "Server is ready on port %d", p);
 
-    // sender thread
-    sender_thread = std::thread([&](){
-        auto last_send = std::chrono::steady_clock::now() - std::chrono::hours(1);
-        while (server_active) {
+    sender_thread = std::thread([&]() {
+        while (true) {
             std::unique_lock<std::mutex> lk(g_queue_mtx);
-            g_queue_cv.wait(lk, [&]{ return !g_cmd_queue.empty() || !server_active; });
-            if (!server_active && g_cmd_queue.empty()) break;
-            std::string cmd = g_cmd_queue.front(); g_cmd_queue.pop(); lk.unlock();
-            int delay_ms = g_delay_ms.load();
+            g_queue_cv.wait(lk, [&] {
+                return !g_cmd_queue.empty() || !server_active;
+            });
+
+            if (!server_active && g_cmd_queue.empty())
+                break;
+
+            std::string cmd = std::move(g_cmd_queue.front());
+            g_cmd_queue.pop();
+            lk.unlock();
+
+            const int delay_ms = g_delay_ms.load();
             if (delay_ms > 0) {
-                auto now = std::chrono::steady_clock::now();
-                auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - last_send).count();
-                if (elapsed < delay_ms) std::this_thread::sleep_for(std::chrono::milliseconds(delay_ms - elapsed));
+                std::this_thread::sleep_for(
+                    std::chrono::milliseconds(delay_ms));
             }
-            std::string json = makeCommandJSON(cmd);
-            broadcast(json);
-            last_send = std::chrono::steady_clock::now();
+
+            if (!server_active)
+                break;
+
+            broadcast(makeCommandJSON(cmd));
             logf(INF, "[SENT] %s", cmd.c_str());
         }
     });
@@ -426,8 +433,18 @@ static void interactive(){
     logf(INF,"Interactive mode. Commands: setting start stop exit quit help");
     interactive_mode.store(true);
     std::string line;
-    while (std::cout << "list2hosting> ", std::getline(std::cin, line)) {
-        if(line.empty()) continue;
+    while (true) {
+        std::cout << "list2hosting> " << std::flush;
+        if (!std::getline(std::cin, line))
+            break;
+
+        if (line.empty())
+            continue;
+        
+        // ユーザー入力の処理中は、logfによる自動再プロンプトを停止する
+        // これにより、コマンド実行中に出るログ（[ENQUEUE]など）がプロンプトを重複させないようにする
+        interactive_mode.store(false);
+
         std::istringstream ss(line); std::string cmd; ss>>cmd;
         std::string lcmd = tolower_s(cmd);
         if(lcmd=="exit"||lcmd=="quit"){
@@ -451,68 +468,103 @@ static void interactive(){
             }
             break;
         }
-        if(lcmd=="help"){ std::cout<<"setting <key> <value>\nstart [port]\nstop\nqueue\nexit\n<any other line> -> send as Minecraft command\n"; continue; }
+        if(lcmd=="help"){ 
+            std::cout<<"setting <key> <value>\nstart [port]\nstop\nqueue\nexit\n<any other line> -> send as Minecraft command\n"; 
+            interactive_mode.store(true); // 次のループのために戻す
+            continue; 
+        }
 
         if(lcmd=="setting"){
-            std::string key, val; ss>>key>>val; if(key.empty()||val.empty()){ logf(WARN,"usage: setting <port|delay> <value>"); continue; }
-            if(key=="port"){ try{ setting_port = std::stoi(val); logf(INF,"port=%d",setting_port);}catch(...){ logf(WARN,"bad port"); } }
-            else if(key=="delay"){ try{ setting_delay = std::stoi(val); logf(INF,"delay=%d",setting_delay);}catch(...){ logf(WARN,"bad delay"); } }
+            std::string key, val; ss>>key>>val; if(key.empty()||val.empty()){ logf(WARN,"usage: setting <port|delay> <value>"); }
+            else if(key=="port"){ try{ setting_port = std::stoi(val); logf(INF,"port=%d",setting_port);}catch(...){ logf(WARN,"bad port"); } }
+            // Bug fix: Update g_delay_ms immediately
+            else if(key=="delay"){ 
+                try{ 
+                    setting_delay = std::stoi(val); 
+                    g_delay_ms = setting_delay; 
+                    logf(INF,"delay=%d",setting_delay);
+                }catch(...){ logf(WARN,"bad delay"); } 
+            }
             else { logf(WARN,"unknown setting"); }
+            interactive_mode.store(true);
             continue;
         }
 
         if(lcmd=="start"){
             int p = setting_port; if(ss>>p) { /* if provided */ }
-            if(server_active){ logf(WARN,"server already running"); continue; }
-            g_delay_ms = setting_delay;
-            // initialize WinSock on Windows
+            if(server_active){ logf(WARN,"server already running"); }
+            else {
+                g_delay_ms = setting_delay;
+                // initialize WinSock on Windows
 #ifdef _WIN32
-            {
-                WSADATA wsa;
-                if (WSAStartup(MAKEWORD(2,2), &wsa) != 0) { logf(ERR, "WSAStartup failed"); continue; }
-            }
+                {
+                    WSADATA wsa;
+                    if (WSAStartup(MAKEWORD(2,2), &wsa) != 0) { logf(ERR, "WSAStartup failed"); }
+                    else {
+                        // start server in background
+                        std::lock_guard<std::mutex> lk(server_mtx);
+                        server_active = true;
+                        server_thread = std::thread(run_server, p);
+                    }
+                }
+#else
+                {
+                    std::lock_guard<std::mutex> lk(server_mtx);
+                    server_active = true;
+                    server_thread = std::thread(run_server, p);
+                }
 #endif
-            // start server in background
-            {
-                std::lock_guard<std::mutex> lk(server_mtx);
-                server_active = true;
-                server_thread = std::thread(run_server, p);
             }
+            interactive_mode.store(true);
             continue;
         }
 
         if(lcmd=="stop"){
-            if(!server_active){ logf(WARN,"server not running"); continue; }
-            // stop server
-            server_active = false;
-            // close listening socket to break accept/poll
-            std::lock_guard<std::mutex> lk(server_mtx);
-            if(server_sock!=INVALID_SOCKET){
+            if(!server_active){ logf(WARN,"server not running"); }
+            else {
+                // stop server
+                server_active = false;
+                // close listening socket to break accept/poll
+                {
+                    std::lock_guard<std::mutex> lk(server_mtx);
+                    if(server_sock!=INVALID_SOCKET){
 #ifdef _WIN32
-                closesocket(server_sock);
+                        closesocket(server_sock);
 #else
-                close(server_sock);
+                        close(server_sock);
 #endif
-                server_sock = INVALID_SOCKET;
-            }
-            // wake sender
-            g_queue_cv.notify_one();
-            if(server_thread.joinable()) server_thread.join();
-            if(sender_thread.joinable()) sender_thread.join();
+                        server_sock = INVALID_SOCKET;
+                    }
+                }
+                // wake sender
+                g_queue_cv.notify_one();
+                if(server_thread.joinable()) server_thread.join();
+                if(sender_thread.joinable()) sender_thread.join();
 #ifdef _WIN32
-            WSACleanup();
+                WSACleanup();
 #endif
-            logf(INF,"server stopped");
+                logf(INF,"server stopped");
+            }
+            interactive_mode.store(true);
             continue;
         }
 
-        if(lcmd=="queue"){ enqueue_command("/say queue"); continue; }
+        if(lcmd=="queue"){ 
+            enqueue_command("/say queue"); 
+            interactive_mode.store(true);
+            continue; 
+        }
         // any other line is treated as a raw command to send
         {
             std::string raw = line;
-            if(!raw.empty()) { enqueue_command(raw); continue; }
+            if(!raw.empty()) { 
+                enqueue_command(raw); 
+                interactive_mode.store(true);
+                continue; 
+            }
         }
         logf(WARN,"unknown cmd");
+        interactive_mode.store(true);
     }
     interactive_mode.store(false);
 }
