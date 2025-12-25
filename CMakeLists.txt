@@ -3,6 +3,9 @@ project(list2hosting LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
+if (MSVC)
+    set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded")
+endif()
 
 add_executable(list2hosting main.cpp)
 
@@ -16,3 +19,4 @@ else()
     message(FATAL_ERROR "OpenSSL not found - install libssl-dev or equivalent")
   endif()
 endif()
+
