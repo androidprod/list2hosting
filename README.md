@@ -3,6 +3,8 @@ las(点群データ)をMinecraft Bedrockのローカルワールドに送信す�
 
 またMinecraft Bedrockで、/connectコマンド又は/wsコマンドで接続できるサーバーを作成します。
 
+![list2hostingのタイトル画像](images/list2hosting.png)
+
 # 使用方法
 ## ビルドバイナリを使う方法
 
